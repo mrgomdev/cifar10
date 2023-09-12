@@ -6,8 +6,8 @@ import pickle
 from tqdm import tqdm
 
 import einops
-
 from PIL import Image
+
 import numpy as np
 import torch.utils.data
 import torchvision.transforms.functional
@@ -64,6 +64,8 @@ class Cifar10Dataset(ImagesDataset):
                 batch = pickle.load(file, encoding='bytes')
                 each_data = einops.rearrange(batch[b'data'], 'batch (channel height width) -> batch height width channel', channel=3, height=32, width=32)
                 each_labels = np.asarray(batch[b'labels'], dtype=np.int64)
+
+                map(lambda x: x in [])
                 images.extend(map(to_pil, each_data))
                 labels.extend(list(each_labels))
         assert len(images) == len(labels)
@@ -119,8 +121,10 @@ if __name__ == '__main__':
 class Classifier(torch.nn.Module):
     def __init__(self):
         super(Classifier, self).__init__()
-        self.conv1 = torch.nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.top = torch.nn.Linear(32 * 32 * 32, 10)
+        self.conv1 = torch.nn.Conv2d(3, 16, kernel_size=3, padding=1)
+        self.top = torch.nn.Linear(16 * 32 * 32, 10)
+
+        print(f"total params: {sum(parameter.numel() for parameter in self.parameters())}")
 
     def forward(self, x):
         x = torch.nn.functional.relu(self.conv1(x))
@@ -222,9 +226,11 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(classifier.parameters(), lr=0.001)
 
     print(f"Accuracy: {eval(classifier=classifier, test_dataloader=test_dataloader)}")
-    for idx in tqdm(range(10), position=0):
+    progress_bar = tqdm(range(10), position=0)
+    for idx in progress_bar:
         train(classifier=classifier, train_dataloader=train_dataloader, epochs=1)
-        print(f"Accuracy: {eval(classifier=classifier, test_dataloader=test_dataloader)}")
+        progress_bar.set_description(f"Test Accuracy: {eval(classifier=classifier, test_dataloader=test_dataloader)}, Train Accuracy: {eval(classifier=classifier, test_dataloader=train_dataloader)}")
+
 
         if False:
             test_dataset = torch.utils.data.Subset(test_dataset, indices=range(4))
@@ -239,4 +245,11 @@ if __name__ == '__main__':
             predicteds = torch.max(predicteds, 1).indices.cpu().numpy()
             labels = np.asarray(test_dataset.labels)
         confusion_matrix = get_confusion_matrix(labels=labels, predicteds=predicteds)
-        torch.save(confusion_matrix, f'./confusion_matrix_{idx:02}.pt')
+        torch.save(confusion_matrix, f'./test_confusion_matrix_{idx:02}.pt')
+
+        if True:
+            predicteds = predict(classifier=classifier, dataset=train_dataset.images_dataset, batch_size=128)
+            predicteds = torch.max(predicteds, 1).indices.cpu().numpy()
+            labels = np.asarray(train_dataset.labels)
+            confusion_matrix = get_confusion_matrix(labels=labels, predicteds=predicteds)
+            torch.save(confusion_matrix, f'./train_confusion_matrix_{idx:02}.pt')

@@ -8,7 +8,7 @@ import streamlit as st
 from main import Cifar10Label
 
 if __name__ == '__main__':
-    confusion_matrix_paths = sorted(glob.glob('./confusion_matrix_*.pt'))
+    confusion_matrix_paths = sorted(glob.glob('./*confusion_matrix_*.pt'))
 
     if 'current_idx' not in st.session_state:
         st.session_state['current_idx'] = 0
