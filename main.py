@@ -8,6 +8,8 @@ from tqdm import tqdm
 import einops
 from PIL import Image
 
+import wandb
+
 import numpy as np
 import torch.utils.data
 import torchvision.transforms.functional
@@ -32,6 +34,49 @@ class Cifar10Label(enum.Enum):
     @classmethod
     def from_name(cls, name: str) -> 'Cifar10Label':
         return cls[name]
+
+
+
+class WandbLogKeys(str, enum.Enum):
+    train_accuracy = 'train_accuracy'
+    train_batch_accuracy = 'train_batch_accuracy'
+    test_accuracy = 'test_accuracy'
+    train_loss = 'train_loss'
+    train_batch_loss = 'train_batch_loss'
+    test_loss = 'test_loss'
+
+    train_confusion_matrix = 'train_confusion_matrix'
+    test_confusion_matrix = 'test_confusion_matrix'
+WANDB_LOG_PERIOD_BATCHES = 50
+
+
+def cutmix(image_batch: torch.Tensor, label_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert image_batch.ndim == 4
+    assert label_batch.ndim == 1
+
+    # 0. Shuffle
+    # 1. combination ratio lamb = beta(alpha, alpha) = uniform(0, 1)
+    # 2. bounding box B = (x, y, w, h) = (uniform(0, 1), uniform(0, 1), sqrt(1 - lamb), sqrt(1 - lamb))
+    # 3. Get Mask.
+    # 4. Mask
+    shuffle_perm = torch.randperm(len(image_batch))
+
+    lamb = np.random.uniform(0, 1)
+
+    x, y = np.random.uniform(0, 1), np.random.uniform(0, 1)
+    w, h = np.sqrt(1 - lamb), np.sqrt(1 - lamb)
+    top, bottom = max(0, int(y * image_batch.shape[3])), min(image_batch.shape[3], int(y * image_batch.shape[3] + h * image_batch.shape[3]))
+    left, right = max(0, int(x * image_batch.shape[2])), min(image_batch.shape[2], int(x * image_batch.shape[2] + w * image_batch.shape[2]))
+    mask = torch.zeros_like(image_batch)
+    mask[:, :, top:bottom, left:right] = 1
+
+    image_batch = image_batch * mask + image_batch[shuffle_perm] * (1 - mask)
+
+    lamb = (right - left) * (bottom - top) / (image_batch.shape[2] * image_batch.shape[3])
+    label_batch = torch.nn.functional.one_hot(label_batch, num_classes=10)
+    label_batch = label_batch * lamb + label_batch[shuffle_perm] * (1 - lamb)
+
+    return image_batch, label_batch
 
 
 class ImagesDataset(torch.utils.data.Dataset):
@@ -65,7 +110,8 @@ class Cifar10Dataset(ImagesDataset):
                 each_data = einops.rearrange(batch[b'data'], 'batch (channel height width) -> batch height width channel', channel=3, height=32, width=32)
                 each_labels = np.asarray(batch[b'labels'], dtype=np.int64)
 
-                map(lambda x: x in [])
+                #TODO: Filter specific class
+
                 images.extend(map(to_pil, each_data))
                 labels.extend(list(each_labels))
         assert len(images) == len(labels)
@@ -101,24 +147,61 @@ class TestDataset(Cifar10Dataset):
         super(TestDataset, self).__init__(data_paths=paths, transform=transform, target_transform=target_transform)
         self.data_dir_path = data_dir_path
 
-if __name__ == '__main__':
-    # Dataload
-    cifar_dir_path = './data/cifar-10-batches-py'
-    transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    train_dataset = TrainDataset(cifar_dir_path, transform=transform)
-    # train_dataset = torch.utils.data.Subset(train_dataset, indices=range(1024))
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=0)
 
-    test_dataset = TestDataset(cifar_dir_path, transform=transform)
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=0)
+################
 
-    # Check
-    # image, label = train_dataset[0]
-    # Image.fromarray(np.transpose(image, (1, 2, 0))).show()
+class CustomBlock(torch.nn.Module):
+    def __init__(self, channels: int, kernel_size: int, stride: int, padding: int):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+        self.conv1 = torch.nn.utils.spectral_norm(self.conv1)
+        self.conv2 = torch.nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+        self.conv2 = torch.nn.utils.spectral_norm(self.conv2)
 
-class Classifier(torch.nn.Module):
+        self.conv_stride = torch.nn.Conv2d(channels, channels, kernel_size=kernel_size, stride=stride, padding=padding)
+
+        self.relu = torch.nn.LeakyReLU(inplace=True)
+
+    def forward(self, x):
+        identity = x
+        x = self.relu(self.conv1(x))
+        x = self.conv2(x)
+        x = self.relu(identity + x)
+        x = self.relu(self.conv_stride(x))
+
+        return x
+
+
+class CustomResNet(torch.nn.Module):
+    def __init__(self, channels: int, num_classes: int):
+        super().__init__()
+        self.channels = channels
+
+        self.conv1 = torch.nn.Conv2d(3, channels, kernel_size=3, stride=1, padding=1)
+        self.layer1 = CustomBlock(channels=channels, kernel_size=3, stride=2, padding=0)
+        self.layer1_2 = CustomBlock(channels=channels, kernel_size=3, stride=1, padding=0)
+        self.layer2 = CustomBlock(channels=channels, kernel_size=3, stride=2, padding=0)
+        self.layer3 = CustomBlock(channels=channels, kernel_size=3, stride=1, padding=0)
+        self.layer4 = CustomBlock(channels=channels, kernel_size=3, stride=1, padding=0)
+        self.top = torch.nn.Linear(channels * 6 * 6, num_classes)
+
+        self.relu = torch.nn.LeakyReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+
+        x = self.layer1(x)
+        x = self.layer1_2(x)
+        x = self.layer2(x)
+        # x = self.layer3(x)
+        # x = self.layer4(x)
+
+        x = torch.flatten(x, 1)
+        x = self.top(x)
+
+        return x
+
+class ShallowCNN(torch.nn.Module):
     def __init__(self):
         super(Classifier, self).__init__()
         self.conv1 = torch.nn.Conv2d(3, 16, kernel_size=3, padding=1)
@@ -133,9 +216,33 @@ class Classifier(torch.nn.Module):
         assert x.shape == (len(x), 10)
 
         return x
+class SpectralNormBasicBlock(torchvision.models.resnet.BasicBlock):
+    def __init__(self, *args, **kwargs):
+        super(SpectralNormBasicBlock, self).__init__(*args, **kwargs)
+        self.conv1 = torch.nn.utils.spectral_norm(self.conv1)
+        self.conv2 = torch.nn.utils.spectral_norm(self.conv2)
+
+class SpectralNormLeakyBasicBlock(SpectralNormBasicBlock):
+    def __init__(self, *args, **kwargs):
+        super(SpectralNormLeakyBasicBlock, self).__init__(*args, **kwargs)
+
+        self.relu = torch.nn.LeakyReLU(inplace=True)
+
+def resnet18_spectral_norm_leaky() -> torchvision.models.resnet.ResNet:
+    return torchvision.models.ResNet(SpectralNormLeakyBasicBlock, [2, 2, 2, 2], num_classes=10)
+def resnet18_spectral_norm() -> torchvision.models.resnet.ResNet:
+    return torchvision.models.ResNet(SpectralNormBasicBlock, [2, 2, 2, 2], num_classes=10)
+def resnet18_no_pretrained() -> torchvision.models.resnet.ResNet:
+    return torchvision.models.resnet18(num_classes=10)
+def resnet34_no_pretrained() -> torchvision.models.resnet.ResNet:
+    return torchvision.models.resnet34(num_classes=10)
+def custom_resnet() -> CustomResNet:
+    return CustomResNet(channels=24, num_classes=10)
+Classifier = resnet18_no_pretrained
 
 # Train
 def train(classifier: torch.nn.Module, train_dataloader: torch.utils.data.DataLoader, epochs: int):
+    global trained_batch_accumulated
     old_training = classifier.training
 
     classifier.train()
@@ -143,6 +250,7 @@ def train(classifier: torch.nn.Module, train_dataloader: torch.utils.data.DataLo
     progress_bar = range(epochs)
     for epoch in progress_bar:
         for i, (images, labels) in enumerate(train_dataloader):
+            imagex, labels = cutmix(images, labels)
             images = images.cuda()
             labels = labels.cuda()
 
@@ -152,12 +260,19 @@ def train(classifier: torch.nn.Module, train_dataloader: torch.utils.data.DataLo
             loss.backward()
             optimizer.step()
 
-        # progress_bar.set_description(f'Epoch: {epoch}, Step: {i}, Loss: {loss.item()}', refresh=True)
+            trained_batch_accumulated += 1
+
+            if trained_batch_accumulated % WANDB_LOG_PERIOD_BATCHES == 0:
+                wandb.log({WandbLogKeys.train_batch_accuracy: torch.sum(torch.max(outputs, 1).indices == torch.max(labels, 1).indices) / len(labels)}, step=trained_batch_accumulated)
+                wandb.log({WandbLogKeys.train_batch_loss: loss.item()}, step=trained_batch_accumulated)
 
     classifier.train(mode=old_training)
 
 
 def predict(classifier: torch.nn.Module, dataset: ImagesDataset, batch_size: int) -> torch.Tensor:
+    if isinstance(dataset[0].shape[0], tuple):
+        dataset = dataset.images_dataset
+
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     outputs = []
@@ -218,38 +333,69 @@ def get_confusion_matrix(labels: np.ndarray, predicteds: np.ndarray) -> np.ndarr
     return matrix
 
 
+def log_confusion_matrix(key: str, classifier: torch.nn.Module, dataset: Cifar10Dataset, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    assert key.endswith('_confusion_matrix'), f"postfix must be '_confusion_matrix', but '{key}'"
+    predicteds = predict(classifier=classifier, dataset=dataset.images_dataset, batch_size=batch_size)
+    predicteds = torch.max(predicteds, 1).indices.cpu().numpy()
+    labels = np.asarray(dataset.labels)
+    wandb.log({key: wandb.plot.confusion_matrix(y_true=labels, preds=predicteds, class_names=[Cifar10Label(idx).name for idx in range(10)])}, step=trained_batch_accumulated)
+
+    return predicteds, labels
+
+
 if __name__ == '__main__':
-    classifier = Classifier()
-    classifier = classifier.cuda()
+    # for Classifier in [ShallowCNN, resnet18_no_pretrained, resnet34_no_pretrained, resnet18_spectral_norm, resnet18_spectral_norm_leaky, custom_resnet]:
+    for Classifier in [custom_resnet]:
+        classifier = Classifier()
+        classifier = classifier.cuda()
 
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(classifier.parameters(), lr=0.001)
+        wandb.init(
+            project='cifar10',
+            config={
+                "learning_rate": 1e-4,
+                "model_name": str(Classifier.__name__),
+                "batch_size": 128,
+                "cutmix": 'Right',
+                "activation": "leaky_relu",
+                "classifier_total_params": sum(parameter.numel() for parameter in classifier.parameters())
+            }
+        )
+        # soft_labeler =
+        # classifier.load_state_dict(torch.load('/home/gimun-lee/PycharmProjects/cifar_classification/wandb/run-20230913_131945-a4ov9mb6/files/classifier.pth'))
+        trained_batch_accumulated = 0 #global
 
-    print(f"Accuracy: {eval(classifier=classifier, test_dataloader=test_dataloader)}")
-    progress_bar = tqdm(range(10), position=0)
-    for idx in progress_bar:
-        train(classifier=classifier, train_dataloader=train_dataloader, epochs=1)
-        progress_bar.set_description(f"Test Accuracy: {eval(classifier=classifier, test_dataloader=test_dataloader)}, Train Accuracy: {eval(classifier=classifier, test_dataloader=train_dataloader)}")
+        try:
+            cifar_dir_path = './data/cifar-10-batches-py'
+            transform = torchvision.transforms.Compose([
+                torchvision.transforms.ToTensor(),
+                torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                torchvision.transforms.RandomHorizontalFlip(p=0.5),
+                torchvision.transforms.RandomVerticalFlip(p=0.1)
+            ])
+            train_dataset = TrainDataset(cifar_dir_path, transform=transform)
+            train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=wandb.config['batch_size'], shuffle=True, num_workers=0)
+            train_eval_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=wandb.config['batch_size'], shuffle=False, num_workers=0)
 
+            test_dataset = TestDataset(cifar_dir_path, transform=transform)
+            test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=wandb.config['batch_size'], shuffle=False, num_workers=0)
 
-        if False:
-            test_dataset = torch.utils.data.Subset(test_dataset, indices=range(4))
-            test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0)
+            criterion = torch.nn.CrossEntropyLoss()
+            optimizer = torch.optim.Adam(classifier.parameters(), lr=wandb.config['learning_rate'])
 
-            test_batch = next(iter(test_dataloader))
-            predicteds = predict(classifier=classifier, dataset=ImagesDataset(images=test_batch[0], transform=None), batch_size=128)
-            predicteds = torch.max(predicteds, 1).indices.cpu().numpy()
-            labels = np.asarray(test_batch[1])
+            wandb.log({WandbLogKeys.test_accuracy: eval(classifier=classifier, test_dataloader=test_dataloader)}, step=trained_batch_accumulated)
+            progress_bar = tqdm(range(25), position=0, desc='epochs')
+            for idx in progress_bar:
+                train(classifier=classifier, train_dataloader=train_dataloader, epochs=1)
+                wandb.log({WandbLogKeys.train_accuracy: eval(classifier=classifier, test_dataloader=train_eval_dataloader)}, step=trained_batch_accumulated)
+                wandb.log({WandbLogKeys.test_accuracy: eval(classifier=classifier, test_dataloader=test_dataloader)}, step=trained_batch_accumulated)
+
+                log_confusion_matrix(key=WandbLogKeys.train_confusion_matrix, classifier=classifier, dataset=train_dataset, batch_size=wandb.config['batch_size'])
+                log_confusion_matrix(key=WandbLogKeys.test_confusion_matrix, classifier=classifier, dataset=test_dataset, batch_size=wandb.config['batch_size'])
+        except (Exception, KeyboardInterrupt) as e:
+            print(repr(e))
+            torch.save(classifier.state_dict(), f"{wandb.run.dir}/classifier.pth")
+            wandb.finish(exit_code=1)
+            raise
         else:
-            predicteds = predict(classifier=classifier, dataset=test_dataset.images_dataset, batch_size=128)
-            predicteds = torch.max(predicteds, 1).indices.cpu().numpy()
-            labels = np.asarray(test_dataset.labels)
-        confusion_matrix = get_confusion_matrix(labels=labels, predicteds=predicteds)
-        torch.save(confusion_matrix, f'./test_confusion_matrix_{idx:02}.pt')
-
-        if True:
-            predicteds = predict(classifier=classifier, dataset=train_dataset.images_dataset, batch_size=128)
-            predicteds = torch.max(predicteds, 1).indices.cpu().numpy()
-            labels = np.asarray(train_dataset.labels)
-            confusion_matrix = get_confusion_matrix(labels=labels, predicteds=predicteds)
-            torch.save(confusion_matrix, f'./train_confusion_matrix_{idx:02}.pt')
+            torch.save(classifier.state_dict(), f"{wandb.run.dir}/classifier.pth")
+            wandb.finish()
